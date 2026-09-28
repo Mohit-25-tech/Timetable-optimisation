@@ -6,6 +6,13 @@ The complete Genetic Algorithm pipeline:
     -> Constraint Repair -> Elitism -> Next Generation -> Termination
     -> Best Timetable
 
+Phase 1 additions (all configurable and off by default):
+    - Adaptive mutation rate (ramps on stagnation, resets on improvement)
+    - Diversity injection (replace worst individuals with fresh ones when stagnating)
+    - Swap-based mutation (mixed with standard mutation via probability)
+    - Memetic local search (hill-climbing on top-k individuals each generation)
+    - Greedy constructive initialization (fraction of population)
+
 This module contains no UI or API concerns -- it is imported directly by both
 the FastAPI backend and the explanatory notebook, so there is exactly one GA
 implementation in the project.
@@ -17,9 +24,12 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from backend.models.schemas import DatasetInput, GAConfig
-from backend.optimizer.chromosome import ProblemContext, Chromosome, create_initial_population
+from backend.optimizer.chromosome import ProblemContext, Chromosome, create_initial_population, create_random_chromosome
 from backend.optimizer.fitness import evaluate, ConstraintCounts
-from backend.optimizer.operators import tournament_selection, two_point_crossover, mutate, repair
+from backend.optimizer.operators import (
+    tournament_selection, two_point_crossover, mutate, repair,
+    swap_mutate, local_search,
+)
 
 
 @dataclass
@@ -48,12 +58,28 @@ class GAResult:
     initial_counts: Optional[ConstraintCounts] = None
 
 
+def _compute_effective_mutation_rate(config: GAConfig, stagnant_generations: int) -> float:
+    """Compute the effective mutation rate for this generation.
+
+    When adaptive_mutation is disabled, returns the static config.mutation_rate.
+    When enabled, linearly ramps from mutation_rate_min toward mutation_rate_max
+    as stagnation grows, using the stagnation_limit as the scaling denominator.
+    """
+    if not config.adaptive_mutation:
+        return config.mutation_rate
+
+    limit = config.stagnation_limit if config.stagnation_limit else 40
+    t = min(stagnant_generations / limit, 1.0)
+    return config.mutation_rate_min + (config.mutation_rate_max - config.mutation_rate_min) * t
+
+
 def run_ga(dataset: DatasetInput, config: GAConfig) -> GAResult:
     start_time = time.time()
     rng = random.Random(config.random_seed) if config.random_seed is not None else random.Random()
 
     ctx = ProblemContext.build(dataset)
-    population = create_initial_population(ctx, config.population_size, rng)
+    population = create_initial_population(ctx, config.population_size, rng,
+                                           greedy_fraction=config.greedy_init_fraction)
 
     history: List[GenerationRecord] = []
     best_chromosome: Optional[Chromosome] = None
@@ -118,6 +144,9 @@ def run_ga(dataset: DatasetInput, config: GAConfig) -> GAResult:
         if generation == config.generations:
             break
 
+        # --- Compute effective mutation rate for this generation ---
+        effective_mutation_rate = _compute_effective_mutation_rate(config, stagnant_generations)
+
         # --- Next generation ---
         # Elitism: carry the best `elite_count` individuals forward unchanged.
         ranked_indices = sorted(range(len(population)), key=lambda i: costs[i])
@@ -134,8 +163,12 @@ def run_ga(dataset: DatasetInput, config: GAConfig) -> GAResult:
             else:
                 child_a, child_b = parent_a, parent_b
 
-            mutate(child_a, ctx, config.mutation_rate, rng)
-            mutate(child_b, ctx, config.mutation_rate, rng)
+            # --- Mutation: choose between swap-only mutation and standard mutation ---
+            for child in (child_a, child_b):
+                if config.swap_mutation_prob > 0.0 and rng.random() < config.swap_mutation_prob:
+                    swap_mutate(child, ctx, effective_mutation_rate, rng)
+                else:
+                    mutate(child, ctx, effective_mutation_rate, rng)
 
             repair(child_a, ctx, rng)
             repair(child_b, ctx, rng)
@@ -143,6 +176,29 @@ def run_ga(dataset: DatasetInput, config: GAConfig) -> GAResult:
             next_population.append(child_a)
             if len(next_population) < config.population_size:
                 next_population.append(child_b)
+
+        # --- Diversity injection ---
+        if config.diversity_injection and stagnant_generations > 0 \
+                and stagnant_generations % config.diversity_trigger_gens == 0:
+            replace_count = max(1, int(config.population_size * config.diversity_replace_pct))
+            # Replace the worst individuals (those at the end of the ranked list).
+            # Elites are at the front of next_population, so we replace from the back.
+            for idx in range(len(next_population) - 1,
+                             max(config.elite_count - 1, len(next_population) - 1 - replace_count), -1):
+                fresh = create_random_chromosome(ctx, rng)
+                repair(fresh, ctx, rng)
+                next_population[idx] = fresh
+
+        # --- Memetic local search on top-k individuals ---
+        if config.local_search_enabled:
+            # Re-evaluate the population to rank them for local search.
+            ls_evals = [evaluate(chromo, ctx, config) for chromo in next_population]
+            ls_costs = [e[0] for e in ls_evals]
+            ls_ranked = sorted(range(len(next_population)), key=lambda i: ls_costs[i])
+            for rank_pos in range(min(config.local_search_top_k, len(ls_ranked))):
+                idx = ls_ranked[rank_pos]
+                local_search(next_population[idx], ctx, config,
+                             config.local_search_iterations, rng)
 
         population = next_population
 

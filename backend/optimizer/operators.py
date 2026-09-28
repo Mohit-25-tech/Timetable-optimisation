@@ -161,3 +161,91 @@ def _discard(occupancy: dict, key: tuple, idx: int) -> None:
     lst = occupancy.get(key)
     if lst and idx in lst:
         lst.remove(idx)
+
+
+# ---------------------------------------------------------------------------
+# Swap-based mutation (Phase 1)
+# ---------------------------------------------------------------------------
+
+def swap_mutate(chromosome: Chromosome, ctx: ProblemContext, mutation_rate: float,
+                rng: random.Random) -> None:
+    """In-place swap-only mutation.
+
+    Each gene independently triggers with probability `mutation_rate`.  When
+    triggered, it swaps its (day, period, room_id) with another randomly chosen
+    gene.  Unlike the standard `mutate()`, no random reassignment occurs -- only
+    pure pairwise swaps.  This preserves the overall slot distribution while
+    still exploring the neighbourhood.
+    """
+    n = len(chromosome)
+    if n < 2:
+        return
+    for i in range(n):
+        if rng.random() >= mutation_rate:
+            continue
+        j = rng.randrange(n)
+        if j == i:
+            continue
+        chromosome[i].day, chromosome[j].day = chromosome[j].day, chromosome[i].day
+        chromosome[i].period, chromosome[j].period = chromosome[j].period, chromosome[i].period
+        chromosome[i].room_id, chromosome[j].room_id = chromosome[j].room_id, chromosome[i].room_id
+
+
+# ---------------------------------------------------------------------------
+# Memetic local search (Phase 1)
+# ---------------------------------------------------------------------------
+
+def local_search(chromosome: Chromosome, ctx: ProblemContext, config,
+                 max_iterations: int, rng: random.Random) -> float:
+    """Short hill-climbing pass that tries random perturbation moves and accepts
+    only improvements (strictly decreasing cost).
+
+    Returns the final cost after the local search pass.  Modifies the chromosome
+    in place.
+
+    The `config` parameter is a GAConfig (or anything with the same weight
+    attributes) used by the evaluate function.
+    """
+    from backend.optimizer.fitness import evaluate as _evaluate
+
+    current_cost, _, _ = _evaluate(chromosome, ctx, config)
+
+    days = ctx.dataset.days
+    n = len(chromosome)
+
+    for _ in range(max_iterations):
+        # Pick a random gene and a random move type.
+        i = rng.randrange(n)
+        gene = chromosome[i]
+        move = rng.choice(("slot", "room", "swap"))
+
+        # Save originals for revert.
+        old_day, old_period, old_room = gene.day, gene.period, gene.room_id
+
+        if move == "slot":
+            gene.day = rng.choice(days)
+            gene.period = rng.randint(1, ctx.dataset.periods_per_day)
+        elif move == "room":
+            gene.room_id = rng.choice(ctx.dataset.rooms).room_id
+        else:  # swap
+            j = rng.randrange(n)
+            if j == i:
+                continue
+            other = chromosome[j]
+            old_j = (other.day, other.period, other.room_id)
+            gene.day, other.day = other.day, gene.day
+            gene.period, other.period = other.period, gene.period
+            gene.room_id, other.room_id = other.room_id, gene.room_id
+
+        new_cost, _, _ = _evaluate(chromosome, ctx, config)
+
+        if new_cost < current_cost:
+            current_cost = new_cost
+        else:
+            # Revert.
+            gene.day, gene.period, gene.room_id = old_day, old_period, old_room
+            if move == "swap":
+                other.day, other.period, other.room_id = old_j  # type: ignore[assignment]
+
+    return current_cost
+

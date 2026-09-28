@@ -52,6 +52,33 @@ class GAConfig(BaseModel):
     stagnation_limit: Optional[int] = Field(default=40, ge=1)
     random_seed: Optional[int] = None
 
+    # --- Phase 1: Premature convergence countermeasures (all off by default) ---
+
+    # Adaptive mutation: ramp mutation rate from min to max as stagnation grows.
+    adaptive_mutation: bool = False
+    mutation_rate_min: float = Field(default=0.05, ge=0.0, le=1.0)
+    mutation_rate_max: float = Field(default=0.40, ge=0.0, le=1.0)
+
+    # Diversity injection: replace worst fraction of population with fresh individuals
+    # when stagnation reaches diversity_trigger_gens (keeps elites untouched).
+    diversity_injection: bool = False
+    diversity_trigger_gens: int = Field(default=15, ge=1)
+    diversity_replace_pct: float = Field(default=0.15, ge=0.01, le=0.50)
+
+    # Swap-based mutation: probability of using pure swap mutation instead of the
+    # standard multi-move mutation. 0.0 = always use standard (current behaviour).
+    swap_mutation_prob: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # Memetic local search: short hill-climbing pass on top-k individuals each gen.
+    local_search_enabled: bool = False
+    local_search_top_k: int = Field(default=5, ge=1, le=50)
+    local_search_iterations: int = Field(default=10, ge=1, le=200)
+
+    # Greedy constructive initialization: fraction of initial population seeded with
+    # a conflict-avoiding, gap-minimizing greedy heuristic. 0.0 = all random.
+    greedy_init_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # --- Constraint weights ---
     hard_faculty_conflict: float = 1000.0
     hard_student_conflict: float = 1000.0
     hard_room_conflict: float = 1000.0
